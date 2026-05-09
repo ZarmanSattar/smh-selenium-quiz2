@@ -3,8 +3,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.keys import Keys
 import requests
 from bs4 import BeautifulSoup
 import time
@@ -14,7 +13,6 @@ app = Flask(__name__)
 
 REGISTRATION = "FA23-BAI-053"
 NEWS_SOURCE = "Sydney Morning Herald"
-NEWS_URL = "https://www.smh.com.au"
 
 
 def get_chrome_driver():
@@ -35,39 +33,85 @@ def get_chrome_driver():
 
 
 def search_smh(keyword):
-    """Use Selenium to search SMH and return the first result URL."""
     driver = get_chrome_driver()
     first_url = None
     try:
-        search_url = f"https://www.smh.com.au/search?query={keyword.replace(' ', '+')}"
-        driver.get(search_url)
-        time.sleep(3)
+        driver.get("https://www.smh.com.au")
+        time.sleep(4)
 
-        # Try to find search result links
-        wait = WebDriverWait(driver, 10)
-        # SMH search results are typically in article cards
-        links = driver.find_elements(By.CSS_SELECTOR, "a[href*='/']")
+        # Dismiss consent popup using JavaScript
+        try:
+            driver.execute_script("""
+                // Remove consent overlay
+                var overlays = document.querySelectorAll('.fc-consent-root, .fc-dialog-overlay, [class*="consent"], [class*="modal"], [class*="overlay"]');
+                overlays.forEach(function(el) { el.remove(); });
+                // Restore body scroll
+                document.body.style.overflow = 'auto';
+            """)
+            time.sleep(1)
+        except Exception:
+            pass
 
-        for link in links:
-            href = link.get_attribute("href")
-            if href and "smh.com.au" in href and href != NEWS_URL + "/":
-                # Filter out nav, footer, and non-article links
-                if any(seg in href for seg in [
-                    "/national/", "/world/", "/politics/", "/business/",
-                    "/technology/", "/sport/", "/entertainment/", "/lifestyle/",
-                    "/environment/", "/culture/", "/federal-politics/"
-                ]):
+        # Use JavaScript to set value and trigger search
+        try:
+            driver.execute_script("""
+                var input = document.querySelector('input[name="query"]');
+                input.value = arguments[0];
+                input.dispatchEvent(new Event('input', {bubbles: true}));
+                input.dispatchEvent(new Event('change', {bubbles: true}));
+            """, keyword)
+            time.sleep(1)
+
+            # Submit the form via JS
+            driver.execute_script("""
+                var form = document.querySelector('input[name="query"]').closest('form');
+                if (form) { form.submit(); }
+            """)
+        except Exception:
+            # Fallback: navigate directly to search URL
+            driver.get(f"https://www.smh.com.au/search?query={keyword.replace(' ', '+')}")
+
+        time.sleep(7)
+
+        # SMH article URL pattern
+        article_pattern = re.compile(r'smh\.com\.au/.+-\d{8}-[a-z0-9]+\.html')
+
+        anchors = driver.find_elements(By.TAG_NAME, "a")
+        for a in anchors:
+            try:
+                href = a.get_attribute("href") or ""
+                if article_pattern.search(href):
                     first_url = href
                     break
+            except Exception:
+                continue
 
-        # Fallback: grab any smh article link
+        # Fallback: any smh .html link
         if not first_url:
-            for link in links:
-                href = link.get_attribute("href")
-                if href and "smh.com.au" in href and len(href) > 30:
-                    if href.startswith("https://www.smh.com.au/") and href != "https://www.smh.com.au/":
+            for a in anchors:
+                try:
+                    href = a.get_attribute("href") or ""
+                    if (
+                        "smh.com.au" in href
+                        and ".html" in href
+                        and len(href) > 60
+                        and href.count("-") > 4
+                    ):
                         first_url = href
                         break
+                except Exception:
+                    continue
+
+        # Last resort: print all links for debugging
+        if not first_url:
+            for a in anchors:
+                try:
+                    href = a.get_attribute("href") or ""
+                    if "smh.com.au" in href and len(href) > 40:
+                        first_url = href
+                        break
+                except Exception:
+                    continue
 
     finally:
         driver.quit()
@@ -76,7 +120,6 @@ def search_smh(keyword):
 
 
 def scrape_article(url):
-    """Scrape article text from the given URL using requests + BeautifulSoup."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -86,39 +129,25 @@ def scrape_article(url):
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Remove script/style tags
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
-
-        # Try article body selectors common on SMH
         article_body = (
             soup.find("div", {"data-testid": "article-body"})
             or soup.find("div", class_=re.compile(r"article|story|content|body", re.I))
             or soup.find("article")
         )
-
-        if article_body:
-            paragraphs = article_body.find_all("p")
-        else:
-            paragraphs = soup.find_all("p")
-
+        paragraphs = article_body.find_all("p") if article_body else soup.find_all("p")
         text = " ".join(p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 40)
         return text
-
-    except Exception as e:
+    except Exception:
         return ""
 
 
 def summarize(text, num_sentences=4):
-    """Simple extractive summary: return first N sentences."""
     if not text:
         return "Could not extract article content."
-
-    # Split into sentences
     sentences = re.split(r'(?<=[.!?])\s+', text)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 30]
-
     summary = " ".join(sentences[:num_sentences])
     return summary if summary else "Could not summarize article."
 
@@ -126,14 +155,10 @@ def summarize(text, num_sentences=4):
 @app.route("/get", methods=["GET"])
 def get_news():
     keyword = request.args.get("keyword", "").strip()
-
     if not keyword:
         return jsonify({"error": "keyword parameter is required"}), 400
-
     try:
-        # Step 1: Search SMH for keyword
         article_url = search_smh(keyword)
-
         if not article_url:
             return jsonify({
                 "registration": REGISTRATION,
@@ -142,13 +167,8 @@ def get_news():
                 "url": "",
                 "summary": "No results found for the given keyword."
             })
-
-        # Step 2: Scrape article
         article_text = scrape_article(article_url)
-
-        # Step 3: Summarize
         summary = summarize(article_text)
-
         return jsonify({
             "registration": REGISTRATION,
             "newssource": NEWS_SOURCE,
@@ -156,7 +176,6 @@ def get_news():
             "url": article_url,
             "summary": summary
         })
-
     except Exception as e:
         return jsonify({
             "registration": REGISTRATION,
